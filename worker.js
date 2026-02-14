@@ -1,10 +1,14 @@
 /**
- * Cloudflare Worker 多项目部署管理器 (V9.9.6 - Auto Obfuscate & Favorites)
- * * 更新日志：
- * 1. [Auto] 自动更新与熔断机制现在支持服务器端混淆 (Server-Side Obfuscation)。
- * 2. [Fuse] 修复流量熔断逻辑，确保超过阈值时自动轮换 UUID 并部署。
- * 3. [UI] 版本管理新增 "查看收藏" 面板，支持管理和回滚收藏版本。
- * 4. [Fix] 修复 Auto Config 保存逻辑，增加自动混淆开关。
+ * Cloudflare Worker 多项目部署管理器 (V10.0.0 - Security & Stability)
+ * 更新日志 (V10.0.0)：
+ * 1. [Security] 登录改为 POST，密码不再通过 URL 明文传递；Cookie 增加 Secure 标志。
+ * 2. [Security] API 增加 HTTP 方法校验，POST 请求增加 CSRF Origin 检查。
+ * 3. [Fix] 修复 serverSideObfuscate 正则误删 URL 的严重 bug。
+ * 4. [Fix] 修复前端 checkUpdate catch 变量名冲突导致错误不显示的 bug。
+ * 5. [Fix] 修复编辑账号时 stats 被重置的问题。
+ * 6. [Improve] 熔断和自动更新改为动态模板识别，不再硬编码。
+ * 7. [Improve] 统一错误响应；前后端模板数据由后端注入，消除重复。
+ * 8. [Improve] compatibility_date 自动使用当前日期。
  */
 
 // ==========================================
@@ -69,9 +73,9 @@ export default {
 
             const url = new URL(request.url);
             const correctCode = env.ACCESS_CODE;
-            const urlCode = url.searchParams.get("code");
             const cookieHeader = request.headers.get("Cookie") || "";
 
+            // 公开路由（无需认证）
             if (url.pathname === "/manifest.json") {
                 return new Response(JSON.stringify({
                     "name": "Worker Pro", "short_name": "WorkerPro", "start_url": "/", "display": "standalone",
@@ -80,8 +84,28 @@ export default {
                 }), { headers: { "Content-Type": "application/json" } });
             }
 
-            if (correctCode && !cookieHeader.includes(`auth=${correctCode}`) && urlCode !== correctCode) {
+            // 登录接口（POST 安全提交）
+            if (url.pathname === "/api/login" && request.method === "POST") {
+                const body = await request.json();
+                if (body.code === correctCode) {
+                    return new Response(JSON.stringify({ success: true }), {
+                        headers: { "Content-Type": "application/json", "Set-Cookie": `auth=${correctCode}; Path=/; HttpOnly; Secure; Max-Age=86400; SameSite=Lax` }
+                    });
+                }
+                return new Response(JSON.stringify({ success: false, msg: "密码错误" }), { status: 401, headers: { "Content-Type": "application/json" } });
+            }
+
+            // 认证检查（仅 Cookie，不再通过 URL 传递密码）
+            if (correctCode && !cookieHeader.includes(`auth=${correctCode}`)) {
                 return new Response(loginHtml(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+            }
+
+            // CSRF 防护（POST 请求校验 Origin）
+            if (request.method === "POST") {
+                const origin = request.headers.get("Origin");
+                if (origin && new URL(origin).host !== url.host) {
+                    return new Response(JSON.stringify({ success: false, msg: "CSRF rejected" }), { status: 403, headers: { "Content-Type": "application/json" } });
+                }
             }
 
             const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`;
@@ -98,7 +122,7 @@ export default {
                 if (request.method === "GET") return new Response(await env.CONFIG_KV.get(VARS_KEY) || "null", { headers: { "Content-Type": "application/json" } });
                 if (request.method === "POST") { await env.CONFIG_KV.put(VARS_KEY, JSON.stringify(await request.json())); return new Response(JSON.stringify({ success: true })); }
             }
-            if (url.pathname === "/api/deploy_config") {
+            if (url.pathname === "/api/deploy_config" && request.method === "GET") {
                 const type = url.searchParams.get("type");
                 const key = `DEPLOY_CONFIG_${type}`;
                 const defaultCfg = { mode: 'latest', currentSha: null, deployTime: null };
@@ -125,14 +149,14 @@ export default {
                     return new Response(JSON.stringify({ success: true }));
                 }
             }
-            if (url.pathname === "/api/check_update") {
+            if (url.pathname === "/api/check_update" && request.method === "GET") {
                 const type = url.searchParams.get("type");
                 const mode = url.searchParams.get("mode");
                 const limitStr = url.searchParams.get("limit");
                 const limit = limitStr ? parseInt(limitStr) : 10;
                 return await handleCheckUpdate(env, type, mode, limit);
             }
-            if (url.pathname === "/api/get_code") {
+            if (url.pathname === "/api/get_code" && request.method === "GET") {
                 const type = url.searchParams.get("type");
                 return await handleGetCode(env, type);
             }
@@ -156,20 +180,16 @@ export default {
                 const { accountId, email, globalKey, workerName, deleteKv } = await request.json();
                 return await handleDeleteWorker(env, accountId, email, globalKey, workerName, deleteKv);
             }
-            if (url.pathname === "/api/stats") return await handleStats(env, ACCOUNTS_KEY);
+            if (url.pathname === "/api/stats" && request.method === "GET") return await handleStats(env, ACCOUNTS_KEY);
             if (url.pathname === "/api/fetch_bindings" && request.method === "POST") {
                 const { accountId, email, globalKey, workerName } = await request.json();
                 return await handleFetchBindings(accountId, email, globalKey, workerName);
             }
 
-            const response = new Response(mainHtml(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
-            if (urlCode === correctCode && correctCode) {
-                response.headers.set("Set-Cookie", `auth=${correctCode}; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax`);
-            }
-            return response;
+            return new Response(mainHtml(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
 
         } catch (err) {
-            return new Response(`System Error: ${err.message}\n${err.stack}`, { status: 500 });
+            return new Response(JSON.stringify({ success: false, msg: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
         }
     }
 };
@@ -199,10 +219,12 @@ function serverSideObfuscate(code) {
     if (!code.includes('var window = globalThis')) {
         code = 'var window = globalThis;\n' + code;
     }
-    // 2. 移除注释 (简单正则)
-    code = code.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, '$1');
-    // 3. 压缩空白
-    code = code.replace(/^\s+|\s+$/gm, '').replace(/\n+/g, '\n');
+    // 2. 移除块注释 /* ... */ （安全）
+    code = code.replace(/\/\*[\s\S]*?\*\//g, '');
+    // 3. 仅移除行首单行注释（避免误删 URL 中的 //）
+    code = code.replace(/^\s*\/\/.*$/gm, '');
+    // 4. 压缩空白
+    code = code.replace(/^\s+|\s+$/gm, '').replace(/\n{2,}/g, '\n');
     return code;
 }
 
@@ -236,9 +258,11 @@ async function handleCronJob(env) {
             const limit = stat.max || 100000;
             // [熔断触发] 超过阈值
             if ((stat.total / limit) * 100 >= fuseThreshold) {
-                // 强制携带 obfuscate 参数进行部署
-                await rotateUUIDAndDeploy(env, 'cmliu', accounts, ACCOUNTS_KEY, autoObfuscate);
-                await rotateUUIDAndDeploy(env, 'joey', accounts, ACCOUNTS_KEY, autoObfuscate);
+                // 动态识别需要熔断的模板（拥有 uuidField 的模板）
+                const fuseTypes = Object.entries(TEMPLATES).filter(([_, t]) => t.uuidField).map(([k]) => k);
+                for (const ft of fuseTypes) {
+                    await rotateUUIDAndDeploy(env, ft, accounts, ACCOUNTS_KEY, autoObfuscate);
+                }
                 actionTaken = true;
                 break;
             }
@@ -246,11 +270,11 @@ async function handleCronJob(env) {
     }
 
     if (!actionTaken) {
-        // [自动更新] 携带混淆参数
-        await Promise.all([
-            checkAndDeployUpdate(env, 'cmliu', accounts, ACCOUNTS_KEY, autoObfuscate),
-            checkAndDeployUpdate(env, 'joey', accounts, ACCOUNTS_KEY, autoObfuscate)
-        ]);
+        // [自动更新] 动态识别模板
+        const updateTypes = Object.entries(TEMPLATES).filter(([_, t]) => t.uuidField).map(([k]) => k);
+        await Promise.all(updateTypes.map(type =>
+            checkAndDeployUpdate(env, type, accounts, ACCOUNTS_KEY, autoObfuscate)
+        ));
     }
 
     config.lastCheck = now;
@@ -416,7 +440,7 @@ async function handleBatchDeploy(env, reqData, accountsKey) {
                 }
             });
 
-            const metadata = { main_module: "index.js", bindings: bindings, compatibility_date: "2024-01-01" };
+            const metadata = { main_module: "index.js", bindings: bindings, compatibility_date: new Date().toISOString().split('T')[0] };
             const formData = new FormData();
             formData.append("metadata", JSON.stringify(metadata));
             formData.append("script", new Blob([scriptContent], { type: "application/javascript+module" }), "index.js");
@@ -536,7 +560,7 @@ async function coreDeployLogic(env, type, variables, deletedVariables, accountsK
                         });
                     }
 
-                    const metadata = { main_module: "index.js", bindings: currentBindings, compatibility_date: "2024-01-01" };
+                    const metadata = { main_module: "index.js", bindings: currentBindings, compatibility_date: new Date().toISOString().split('T')[0] };
                     const formData = new FormData();
                     formData.append("metadata", JSON.stringify(metadata));
                     formData.append("script", new Blob([githubScriptContent], { type: "application/javascript+module" }), "index.js");
@@ -688,7 +712,30 @@ async function handleDeleteWorker(env, accountId, email, key, workerName, delete
     } catch (e) { return new Response(JSON.stringify({ success: false, msg: e.message }), { status: 500 }); }
 }
 
-function loginHtml() { return `<!DOCTYPE html><html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f3f4f6"><form method="GET"><input type="password" name="code" placeholder="密码" style="padding:10px"><button style="padding:10px">登录</button></form></body></html>`; }
+function loginHtml() {
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Login</title></head>
+<body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f3f4f6;font-family:sans-serif">
+<div style="background:white;padding:2rem;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);text-align:center">
+<h2 style="margin:0 0 1rem;color:#1e293b">🔒 Worker 中控</h2>
+<input type="password" id="login_code" placeholder="请输入密码" style="padding:10px;border:1px solid #cbd5e1;border-radius:4px;width:200px;margin-bottom:10px;display:block">
+<button onclick="doLogin()" style="padding:10px 24px;background:#1e293b;color:white;border:none;border-radius:4px;cursor:pointer;width:100%">登录</button>
+<div id="login_msg" style="color:red;font-size:12px;margin-top:8px"></div>
+</div>
+<script>
+async function doLogin(){
+    const code=document.getElementById('login_code').value;
+    const msg=document.getElementById('login_msg');
+    if(!code){msg.innerText='请输入密码';return;}
+    try{
+        const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+        const d=await r.json();
+        if(d.success){location.reload();}else{msg.innerText=d.msg||'密码错误';}
+    }catch(e){msg.innerText='网络错误';}
+}
+document.getElementById('login_code').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+</script>
+</body></html>`;
+}
 
 // ==========================================
 // 2. 前端页面 (完整 HTML)
@@ -701,7 +748,7 @@ function mainHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="manifest" href="/manifest.json">
-    <title>Worker 智能中控 (V9.9.6)</title>
+    <title>Worker 智能中控 (V10.0.0)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator/dist/index.browser.js"></script>
@@ -723,8 +770,8 @@ function mainHtml() {
       
       <header class="bg-white px-4 py-3 md:px-6 md:py-4 rounded shadow flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
           <div class="flex-none">
-              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V9.9.6</span></h1>
-              <div class="text-[10px] text-gray-400 mt-1">熔断混淆 · 收藏管理 · 全量修复</div>
+              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V10.0.0</span></h1>
+              <div class="text-[10px] text-gray-400 mt-1">安全加固 · 熔断混淆 · 收藏管理</div>
           </div>
           <div id="logs" class="bg-slate-900 text-green-400 p-2 rounded text-xs font-mono hidden max-h-[80px] lg:max-h-[50px] overflow-y-auto shadow-inner w-full lg:flex-1 lg:mx-4 order-2 lg:order-none"></div>
           
@@ -1001,22 +1048,8 @@ function mainHtml() {
     </div>
 
     <script>
-      const TEMPLATES = { 
-        'cmliu': { defaultVars: ["UUID", "PROXYIP", "DOH", "PATH", "URL", "KEY", "ADMIN"], uuidField: "UUID", name: "CMliu" }, 
-        'joey': { defaultVars: ["u", "d", "p"], uuidField: "u", name: "Joey" }, 
-        'ech': { defaultVars: ["PROXYIP"], uuidField: "", name: "ECH" } 
-      };
-      
-      const ECH_PROXIES = [
-          {group:"Global", list:["ProxyIP.CMLiussss.net", "ProxyIP.Aliyun.CMLiussss.net", "ProxyIP.Oracle.CMLiussss.net"]},
-          {group:"HK (香港)", list:["ProxyIP.HK.CMLiussss.net", "ProxyIP.Aliyun.HK.CMLiussss.net", "ProxyIP.Oracle.HK.CMLiussss.net"]},
-          {group:"JP (日本)", list:["ProxyIP.JP.CMLiussss.net", "ProxyIP.Aliyun.JP.CMLiussss.net", "ProxyIP.Oracle.JP.CMLiussss.net"]},
-          {group:"SG (新加坡)", list:["ProxyIP.SG.CMLiussss.net", "ProxyIP.Aliyun.SG.CMLiussss.net", "ProxyIP.Oracle.SG.CMLiussss.net"]},
-          {group:"KR (韩国)", list:["ProxyIP.KR.CMLiussss.net", "ProxyIP.Oracle.KR.CMLiussss.net"]},
-          {group:"US (美国)", list:["ProxyIP.US.CMLiussss.net", "ProxyIP.Aliyun.US.CMLiussss.net", "ProxyIP.Oracle.US.CMLiussss.net"]},
-          {group:"Europe", list:["ProxyIP.DE.CMLiussss.net (德国)", "ProxyIP.UK.CMLiussss.net (英国)", "ProxyIP.FR.CMLiussss.net (法国)", "ProxyIP.NL.CMLiussss.net (荷兰)", "ProxyIP.RU.CMLiussss.net (俄罗斯)"]},
-          {group:"Others", list:["ProxyIP.TW.CMLiussss.net (台湾)", "ProxyIP.AU.CMLiussss.net (澳洲)", "ProxyIP.IN.CMLiussss.net (印度)"]}
-      ];
+      const TEMPLATES = ${JSON.stringify(Object.fromEntries(Object.entries(TEMPLATES).map(([k, v]) => [k, { defaultVars: v.defaultVars, uuidField: v.uuidField, name: v.name }])))};
+      const ECH_PROXIES = ${JSON.stringify(ECH_PROXIES)};
   
       let accounts = [];
       let editingIndex = -1;
@@ -1334,7 +1367,7 @@ function mainHtml() {
               globalKey:document.getElementById('in_gkey').value,
               defaultZoneName:document.getElementById('in_zone_name').value,
               defaultZoneId:document.getElementById('in_zone_id').value,
-              stats:{total:0,max:100000}
+              stats:(editingIndex>=0 && accounts[editingIndex]) ? (accounts[editingIndex].stats || {total:0,max:100000}) : {total:0,max:100000}
           }; 
           ['cmliu','joey','ech'].forEach(t=>o['workers_'+t]=document.getElementById('in_workers_'+t).value.split(/,|，/).map(s=>s.trim()).filter(s=>s)); 
           if(editingIndex>=0)accounts[editingIndex]=o; else accounts.push(o); 
@@ -1416,7 +1449,7 @@ function mainHtml() {
       async function saveAutoConfig(){ await fetch('/api/auto_config',{method:'POST',body:JSON.stringify({enabled:document.getElementById('auto_update_toggle').checked, obfuscate:document.getElementById('auto_obfuscate_toggle').checked, interval:document.getElementById('auto_update_interval').value, fuseThreshold:document.getElementById('fuse_threshold').value})}); alert('已保存配置'); }
       
       async function checkUpdate(t){ 
-          const e=document.getElementById(\`ver_\${t}\`); 
+          const el=document.getElementById(\`ver_\${t}\`); 
           try{ 
               const r=await fetch(\`/api/check_update?type=\${t}\`); 
               const d=await r.json(); 
@@ -1440,9 +1473,9 @@ function mainHtml() {
               const localClass = (d.local && d.remote && d.local.sha === d.remote.sha) ? 'text-gray-500' : 'text-orange-500 font-bold';
               const localHtml = \`<div class="flex justify-between \${localClass}"><span>💻 本地: \${localDateStr}</span><span>\${d.mode==='fixed'?'🔒 Locked':''}</span></div>\`;
 
-              e.innerHTML = statusHtml + localHtml;
-          }catch(e){ 
-              e.innerHTML="<span class='text-red-400'>Check Fail</span>"; 
+              el.innerHTML = statusHtml + localHtml;
+          }catch(err){ 
+              el.innerHTML="<span class='text-red-400'>Check Fail</span>"; 
           } 
       }
       
