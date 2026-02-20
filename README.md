@@ -1,42 +1,32 @@
-# 🚀 Cloudflare Worker 智能部署中控 (V10.6.0)
+# 🚀 Cloudflare Worker 智能部署中控 (V10.8.0)
 
 > 全部代码为 Claude Code 完成
 > 自行修改延伸功能
 
-> **版本状态**: V10.6.0 Stable
-> **核心进化**: 一键修复 1101 + 全场景自动化部署。
+> **版本状态**: V10.8.0 Stable
+> **核心进化**: ECH 禁用 workers.dev 开关 + Token 鉴权 + 一键修复 1101。
 
 本项目是一个基于 Cloudflare Worker 构建的深度集成化部署管理平台。它不仅能管理多个 Cloudflare 账号，还支持一键批量部署、版本回滚、自动化流量熔断以及代码级的混淆加固，是管理大规模 Worker 节点的终极工具。
 
 ---
 
-## 🆕 V10.6.0 更新日志
+## 🆕 V10.8.0 更新日志
 
-### 🚀 新功能
+### 🚫 禁用 workers.dev 域名开关
 
-* 工作台改为弹窗显示，主页添加「📋 工作台」按钮打开，支持清空和隐藏。
-* 批量部署新增「📦 采用已保存变量 (VARS)」复选框，默认开启，自动读取 VARS_cmliu/joey 变量值。
-* 修复 1101 实时打印每一步骤到工作台。
+* ECH 配置卡片新增「🚫 禁用默认 \*.workers.dev 域名」复选框（默认不勾选）。
+* 勾选后部署成功，自动调用 CF API 将该 Worker 的 workers.dev 子域名禁用。
+* 不勾选则保持启用（默认行为）。
 
-### ✨ 改进
+### 🔑 ECH Token 鉴权开关
 
-* 所有操作（部署、修复 1101、批量部署）日志统一输出到工作台弹窗。
+* ECH 配置卡片新增 Toggle 开关 + Token 输入框。
+* **开关开启 + 有 Token** → 部署时注入 `ech.js` 中的 `const token`，启用 WebSocket 鉴权。
+* **开关关闭或不填** → Token 保持空（无鉴权）。
 
-### 🚀 新功能
+### 📋 完整历史版本
 
-* 一键修复 1101：记录变量 + 域名 → 删除 Worker → 随机改子域名 → 重建（同名）→ 恢复变量 + 自定义域名。
-
-### 🗑️ 移除
-
-* 删除所有混淆功能（服务端反指纹混淆、前端 JavaScriptObfuscator、自动混淆开关）。
-
-### 🐛 修复
-
-* `DEPLOY_CONFIG` 更新不再依赖 SHA，修复本地时间不更新。
-
-### 📋 版本日志
-
-* 完整历史版本记录见 [CHANGELOG.md](CHANGELOG.md)。
+> 见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -288,7 +278,7 @@
 | --- | --- | --- | --- |
 | **cmliu** | EdgeTunnel (Beta 2.0) | 功能最全，支持订阅 | 开启 KV |
 | **joey** | 少年你相信光吗 | 自动修复，极简 | **关闭 KV** (变量模式) |
-| **ech** | ECH Proxy | 无需维护，WebSocket | 关闭 KV |
+| **ech** | ECH Proxy | 无需维护，WebSocket，支持 Token 鉴权 | 关闭 KV |
 
 ---
 

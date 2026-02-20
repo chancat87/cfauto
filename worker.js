@@ -1,8 +1,7 @@
 /**
- * Cloudflare Worker 多项目部署管理器 (V10.6.0 - Starfield Theme)
- * 更新日志 (V10.6.0)：
- * 1. [Feature] 一键修复 1101：删除 → 改域名 → 重建 → 恢复变量+域名。
- * 2. [Remove] 删除所有混淆功能。
+ * Cloudflare Worker 多项目部署管理器 (V10.8.0 - ECH Workers.dev Switch)
+ * 更新日志 (V10.8.0)：
+ * 1. [Feature] ECH 部署新增"禁用 workers.dev 域名"开关，部署成功后自动调用 CF API 控制。
  * 完整历史版本记录见 CHANGELOG.md
  */
 
@@ -156,8 +155,8 @@ export default {
                 return await handleGetCode(env, type);
             }
             if (url.pathname === "/api/deploy" && request.method === "POST") {
-                const { type, variables, deletedVariables, targetSha, customCode } = await request.json();
-                return await handleManualDeploy(env, type, variables, deletedVariables, ACCOUNTS_KEY, targetSha, customCode);
+                const { type, variables, deletedVariables, targetSha, customCode, echTokenEnabled, echDisableWorkersDev } = await request.json();
+                return await handleManualDeploy(env, type, variables, deletedVariables, ACCOUNTS_KEY, targetSha, customCode, echTokenEnabled, echDisableWorkersDev);
             }
             if (url.pathname === "/api/batch_deploy" && request.method === "POST") {
                 const data = await request.json();
@@ -357,13 +356,12 @@ async function handleCheckUpdate(env, type, mode, limit = 10) {
     } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
 }
 
-async function handleManualDeploy(env, type, variables, deletedVariables, accountsKey, targetSha, customCode) {
+async function handleManualDeploy(env, type, variables, deletedVariables, accountsKey, targetSha, customCode, echTokenEnabled, echDisableWorkersDev) {
     if (customCode) {
-        // 批量部署提供的前端混淆代码，直接使用
-        const result = await coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, customCode);
+        const result = await coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, customCode, echTokenEnabled, echDisableWorkersDev);
         return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
     }
-    const result = await coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha);
+    const result = await coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, null, echTokenEnabled, echDisableWorkersDev);
     return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
 }
 
@@ -497,7 +495,7 @@ async function handleBatchDeploy(env, reqData, accountsKey) {
 }
 
 // 核心部署逻辑
-async function coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, customCode = null) {
+async function coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, customCode = null, echTokenEnabled = false, echDisableWorkersDev = false) {
     try {
         // 规范化：'latest' 和空值统一视为“跟随最新”
         const isLatestMode = !targetSha || targetSha === 'latest';
@@ -546,8 +544,16 @@ async function coreDeployLogic(env, type, variables, deletedVariables, accountsK
         if (type === 'ech') {
             const proxyVar = variables ? variables.find(v => v.key === 'PROXYIP') : null;
             const targetIP = proxyVar && proxyVar.value ? proxyVar.value.trim() : 'ProxyIP.CMLiussss.net';
-            const regex = /const\s+CF_FALLBACK_IPS\s*=\s*\[.*?\];/s;
-            githubScriptContent = githubScriptContent.replace(regex, `const CF_FALLBACK_IPS = ['${targetIP}'];`);
+            const proxyRegex = /const\s+CF_FALLBACK_IPS\s*=\s*\[.*?\];/s;
+            githubScriptContent = githubScriptContent.replace(proxyRegex, `const CF_FALLBACK_IPS = ['${targetIP}'];`);
+
+            // Token 注入：仅当 TOKEN 变量存在、有值且 echTokenEnabled=true 时才注入
+            const tokenVar = variables ? variables.find(v => v.key === 'TOKEN') : null;
+            const tokenVal = (tokenVar && tokenVar.value && tokenVar.value.trim() && echTokenEnabled)
+                ? tokenVar.value.trim()
+                : '';
+            const tokenRegex = /const\s+token\s*=\s*['"]{1}.*?['"]{1};/;
+            githubScriptContent = githubScriptContent.replace(tokenRegex, `const token = '${tokenVal}';`);
         }
 
 
@@ -585,7 +591,18 @@ async function coreDeployLogic(env, type, variables, deletedVariables, accountsK
 
                     if (updateRes.ok) {
                         logItem.success = true;
-                        logItem.msg = `✅ Ver: ${deployedSha ? deployedSha.substring(0, 7) : 'Unknown'}`;
+                        const msgs = [`✅ Ver: ${deployedSha ? deployedSha.substring(0, 7) : 'Unknown'}`];
+                        // ECH 专属：控制 workers.dev 子域名启用/禁用
+                        if (type === 'ech') {
+                            try {
+                                await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/scripts/${wName}/subdomain`, {
+                                    method: 'POST', headers: jsonHeaders,
+                                    body: JSON.stringify({ enabled: !echDisableWorkersDev })
+                                });
+                                msgs.push(echDisableWorkersDev ? '🚫 默认域名已禁用' : '🌐 默认域名已启用');
+                            } catch (e) { msgs.push('⚠️ 域名状态设置失败'); }
+                        }
+                        logItem.msg = msgs.join(' | ');
                     } else {
                         logItem.msg = `❌ ${(await updateRes.json()).errors?.[0]?.message}`;
                     }
@@ -1217,6 +1234,21 @@ function mainHtml() {
                 <div class="bg-green-50 px-4 py-2 flex justify-between items-center border-b border-green-100"><span class="text-sm font-bold text-green-700">🟢 ECH 配置</span><span class="text-[9px] px-1.5 py-0.5 rounded text-white bg-green-500">Stable</span></div>
                 <div class="p-3">
                     <div class="mb-2 p-2 bg-slate-50 border rounded text-xs"><div id="ech_proxy_selector_container" class="mb-2"></div><div id="vars_ech" class="space-y-1"></div></div>
+                    <div class="mb-2 p-2 bg-slate-50 border border-dashed border-green-300 rounded text-xs">
+                        <div class="flex items-center gap-2 mb-1">
+                            <div class="relative inline-block w-8 align-middle select-none">
+                                <input type="checkbox" id="ech_token_enabled" class="toggle-checkbox absolute block w-4 h-4 rounded-full bg-white border-4 appearance-none cursor-pointer border-gray-300" onchange="toggleEchToken()"/>
+                                <label for="ech_token_enabled" class="toggle-label block overflow-hidden h-4 rounded-full bg-gray-300 cursor-pointer"></label>
+                            </div>
+                            <span class="font-bold text-green-700">🔑 Token 鉴权</span>
+                            <span id="ech_token_status" class="text-gray-400 text-[10px]">(关闭 - 不填入)</span>
+                        </div>
+                        <input id="ech_token_input" type="text" placeholder="填写 Token 后开启开关才会生效" class="input-field w-full opacity-50 cursor-not-allowed" disabled/>
+                        <div class="flex items-center gap-2 mt-2 pt-2 border-t border-green-200">
+                            <input type="checkbox" id="ech_disable_workers_dev" class="w-4 h-4 text-red-600 border-gray-300 rounded cursor-pointer">
+                            <label for="ech_disable_workers_dev" class="font-bold text-gray-700 cursor-pointer">🚫 禁用默认 *.workers.dev 域名</label>
+                        </div>
+                    </div>
                     <div class="flex gap-2">
                         <button onclick="selectSyncAccount('ech')" class="flex-1 bg-orange-50 text-orange-600 border border-orange-200 text-xs px-2 py-1 rounded hover:bg-orange-100">🔄 同步</button>
                         <button onclick="deploy('ech')" id="btn_deploy_ech" class="flex-[2] bg-green-600 text-white text-xs py-1.5 rounded hover:bg-green-700 font-bold">🚀 部署 ECH</button>
@@ -1814,19 +1846,53 @@ function mainHtml() {
       async function deleteFromEdit(){ if(editingIndex>=0)delAccount(editingIndex); cancelEdit(); }
       async function loadStats(){ const b=document.getElementById('btn_stats'); b.disabled=true; try{ const r=await fetch('/api/stats'); const d=await r.json(); accounts.forEach(a=>{ const s=d.find(x=>x.alias===a.alias); a.stats=s&&!s.error?s:{total:0,max:100000}; }); renderTable(); }catch(e){} b.disabled=false; }
       
+      function toggleEchToken() {
+          const enabled = document.getElementById('ech_token_enabled').checked;
+          const input = document.getElementById('ech_token_input');
+          const status = document.getElementById('ech_token_status');
+          if (enabled) {
+              input.disabled = false;
+              input.classList.remove('opacity-50', 'cursor-not-allowed');
+              status.textContent = '(已开启 - Token 将注入)';
+              status.className = 'text-green-600 text-[10px] font-bold';
+          } else {
+              input.disabled = true;
+              input.classList.add('opacity-50', 'cursor-not-allowed');
+              status.textContent = '(关闭 - 不填入)';
+              status.className = 'text-gray-400 text-[10px]';
+          }
+      }
+
       async function deploy(t, sha='') {
-         const btn = document.getElementById(\`btn_deploy_\${t}\`); const ot = btn.innerText; btn.innerText = "⏳ 部署中..."; btn.disabled = true;
-         const vars = []; document.querySelectorAll(\`.var-row-\${t}\`).forEach(r => { const k = r.querySelector('.key').value; const v = r.querySelector('.val').value; if(k) vars.push({key: k, value: v}); });
-         await fetch(\`/api/settings?type=\${t}\`, {method: 'POST', body: JSON.stringify(vars)});
+         const btn = document.getElementById('btn_deploy_' + t); const ot = btn.innerText; btn.innerText = '⏳ 部署中...'; btn.disabled = true;
+         const vars = []; document.querySelectorAll('.var-row-' + t).forEach(r => { const k = r.querySelector('.key').value; const v = r.querySelector('.val').value; if(k) vars.push({key: k, value: v}); });
+
+         // ECH Token 处理：开关开启且有 token 值，则把 TOKEN 加入 vars
+         let echTokenEnabled = false;
+         let echDisableWorkersDev = false;
+         if (t === 'ech') {
+             const tokenEnabled = document.getElementById('ech_token_enabled').checked;
+             const tokenVal = document.getElementById('ech_token_input').value.trim();
+             echTokenEnabled = tokenEnabled && !!tokenVal;
+             if (tokenVal) {
+                 const idx = vars.findIndex(v => v.key === 'TOKEN');
+                 if (idx !== -1) vars[idx].value = tokenVal;
+                 else vars.push({ key: 'TOKEN', value: tokenVal });
+             }
+             vars._echTokenEnabled = echTokenEnabled;
+             echDisableWorkersDev = document.getElementById('ech_disable_workers_dev').checked;
+         }
+
+         await fetch('/api/settings?type=' + t, {method: 'POST', body: JSON.stringify(vars)});
          openWorkbench();
-         wbLog(\`⚡ Deploying \${t}...\`, 'text-yellow-400');
+         wbLog('⚡ Deploying ' + t + '...', 'text-yellow-400');
          try {
-             const res = await fetch(\`/api/deploy?type=\${t}\`, { method: 'POST', body: JSON.stringify({ type: t, variables: vars, deletedVariables: deletedVars[t], targetSha: sha }) });
+             const res = await fetch('/api/deploy?type=' + t, { method: 'POST', body: JSON.stringify({ type: t, variables: vars, deletedVariables: deletedVars[t], targetSha: sha, echTokenEnabled: echTokenEnabled, echDisableWorkersDev: echDisableWorkersDev }) });
              const logs = await res.json();
-             logs.forEach(l => wbLog(\`[\${l.success ? 'OK' : 'ERR'}] \${l.name}: \${l.msg}\`, l.success ? '' : 'text-red-400'));
+             logs.forEach(l => wbLog('[' + (l.success ? 'OK' : 'ERR') + '] ' + l.name + ': ' + l.msg, l.success ? '' : 'text-red-400'));
              deletedVars[t] = [];
              setTimeout(() => { checkUpdate(t); checkDeployConfig(t); }, 1000);
-         } catch(e) { wbLog(\`Error: \${e.message}\`, 'text-red-500'); }
+         } catch(e) { wbLog('Error: ' + e.message, 'text-red-500'); }
          btn.innerText = ot; btn.disabled = false;
       }
 
